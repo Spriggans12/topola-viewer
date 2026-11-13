@@ -10,7 +10,16 @@ import {
   zoomTransform,
 } from 'd3-zoom';
 import {IntlShape} from 'react-intl';
-import {ChartHandle, ChartInfo, createChart} from 'topola';
+import {
+  ChartHandle,
+  ChartInfo,
+  CollapsedSets,
+  createChart,
+  ExpanderDirection,
+  ExpanderState,
+  getChildExpanderId,
+  toggleExpander,
+} from 'topola';
 import {
   chartColors,
   ChartProps,
@@ -45,21 +54,14 @@ interface NodePosition {
     parentId?: string;
     indiParentNodeId?: string;
     spouseParentNodeId?: string;
+    indi?: {id: string; expander?: ExpanderState};
+    spouse?: {expander?: ExpanderState};
+    family?: {expander?: ExpanderState};
   };
 }
 
 /** Part of the chart shown again by a [+] button. */
 type RevealedBranch = 'indiParents' | 'spouseParents' | 'children';
-
-/**
- * Collapsed branches by node id, as used by topola's chart handle (see
- * SimpleChartHandle).
- */
-interface CollapsedSets {
-  collapsedIndi: Set<string>;
-  collapsedSpouse: Set<string>;
-  collapsedFamily: Set<string>;
-}
 
 /**
  * A node whose position on screen should be kept after the next render, given
@@ -159,16 +161,15 @@ function calculateScaleExtent(
 }
 
 /**
- * Returns the position, in the scrollable container, of the node containing
- * the given element of the chart's controls, as currently drawn.
+ * Returns the position, in the scrollable container, of the given node, as
+ * currently drawn.
  */
-function getScrollAnchor(element: Element): ScrollAnchor | undefined {
-  const controls = element.closest('g.controls');
+function getScrollAnchor(nodeId: string): ScrollAnchor | undefined {
+  const controls = select('#chart')
+    .selectAll<Element, NodePosition>('g.controls')
+    .filter((node) => node.id === nodeId)
+    .node();
   if (!controls) {
-    return undefined;
-  }
-  const node = select<Element, NodePosition>(controls).datum();
-  if (!node?.id) {
     return undefined;
   }
   // The transitions to the new layout have not started yet: the transforms
@@ -184,10 +185,42 @@ function getScrollAnchor(element: Element): ScrollAnchor | undefined {
   const parent = select('#svgContainer').node() as Element;
   const scale = zoomTransform(parent).k;
   return {
-    nodeId: node.id,
+    nodeId,
     x: offsetX + (originX + nodeX) * scale,
     y: offsetY + (originY + nodeY) * scale,
   };
+}
+
+/**
+ * Returns the node to keep in place when a child is hidden: the sibling
+ * nearest to it on the screen, or its parents if it has no siblings. In the
+ * relatives chart, the parents can be far from their children.
+ */
+function getHiddenChildAnchor(
+  nodeId: string,
+  parentId: string,
+  childId: string,
+): ScrollAnchor | undefined {
+  const child = getScrollAnchor(nodeId);
+  const siblings = select('#chart')
+    .selectAll<Element, NodePosition>('g.controls')
+    .data()
+    .flatMap((other) => {
+      const isSibling =
+        other.data?.parentId === parentId &&
+        // Other marriages of the hidden child have the same parent.
+        other.data.indi?.id !== childId;
+      const anchor = isSibling && other.id && getScrollAnchor(other.id);
+      return anchor ? [anchor] : [];
+    });
+  if (!child || !siblings.length) {
+    return getScrollAnchor(parentId);
+  }
+  const distance = (anchor: ScrollAnchor) =>
+    Math.hypot(anchor.x - child.x, anchor.y - child.y);
+  return siblings.reduce((nearest, anchor) =>
+    distance(anchor) < distance(nearest) ? anchor : nearest,
+  );
 }
 
 export class ChartWrapper {
@@ -218,6 +251,7 @@ export class ChartWrapper {
     collapsedIndi: new Set<string>(),
     collapsedSpouse: new Set<string>(),
     collapsedFamily: new Set<string>(),
+    collapsedChild: new Set<string>(),
   };
 
   zoom(factor: number) {
@@ -472,29 +506,47 @@ export class ChartWrapper {
       // let topola handle the click.
       return;
     }
-    const sets = this.collapsed;
     event.stopPropagation();
-    const id = select<Element, NodePosition>(expander).datum()?.id;
-    if (!id) {
+    const node = select<Element, NodePosition>(expander).datum();
+    if (!node?.id) {
       return;
     }
-    const set = expander.classList.contains('familyExpander')
-      ? sets.collapsedFamily
-      : expander.classList.contains('spouseExpander')
-        ? sets.collapsedSpouse
-        : sets.collapsedIndi;
-    const expanding = set.has(id);
-    if (expanding) {
-      set.delete(id);
-    } else {
-      set.add(id);
+    const classes = expander.classList;
+    if (classes.contains('childExpander')) {
+      const parentId = node.data?.parentId;
+      const childId = node.data?.indi?.id;
+      if (!parentId || !childId) {
+        return;
+      }
+      toggleExpander(
+        this.collapsed,
+        getChildExpanderId(parentId, childId),
+        ExpanderDirection.CHILD,
+      );
+      this.scrollAnchor = getHiddenChildAnchor(node.id, parentId, childId);
+      this.refresh();
+      return;
     }
-    const anchor = getScrollAnchor(expander);
+    const direction = classes.contains('familyExpander')
+      ? ExpanderDirection.FAMILY
+      : classes.contains('spouseExpander')
+        ? ExpanderDirection.SPOUSE
+        : ExpanderDirection.INDI;
+    const entry =
+      direction === ExpanderDirection.FAMILY
+        ? node.data?.family
+        : direction === ExpanderDirection.SPOUSE
+          ? node.data?.spouse
+          : node.data?.indi;
+    // A [+] shows a branch again (for a family, all its hidden children).
+    const expanding = entry?.expander === ExpanderState.PLUS;
+    toggleExpander(this.collapsed, node.id, direction);
+    const anchor = getScrollAnchor(node.id);
     if (anchor && expanding) {
       anchor.revealed =
-        set === sets.collapsedFamily
+        direction === ExpanderDirection.FAMILY
           ? 'children'
-          : set === sets.collapsedSpouse
+          : direction === ExpanderDirection.SPOUSE
             ? 'spouseParents'
             : 'indiParents';
     }
@@ -507,6 +559,7 @@ export class ChartWrapper {
     this.collapsed.collapsedIndi.clear();
     this.collapsed.collapsedSpouse.clear();
     this.collapsed.collapsedFamily.clear();
+    this.collapsed.collapsedChild.clear();
   }
 
   /** Whether the current chart handle keeps the collapsed branches. */
@@ -515,7 +568,8 @@ export class ChartWrapper {
     return !!(
       handle?.collapsedIndi &&
       handle.collapsedSpouse &&
-      handle.collapsedFamily
+      handle.collapsedFamily &&
+      handle.collapsedChild
     );
   }
 

@@ -3,7 +3,8 @@ import {readFile} from 'node:fs/promises';
 import {setupGedcomRoute} from './helpers';
 
 // In test.ged, Bonifacy Gibbs (I1) is married to Jarmila Valenta (I2), whose
-// parents are Temuri Valenta and Darby Varley.
+// parents are Temuri Valenta and Darby Varley. Their children (family F1) are
+// Asim and Marie (I4), mother of Gandalf.
 const URL = '/#/view?url=https://example.org/family.ged&indi=I1';
 
 /** Longer than the chart transitions. */
@@ -11,21 +12,42 @@ const ANIMATION_MS = 1500;
 /** Longer than the longest wait for an animation in chart_wrapper.ts. */
 const MAX_ANIMATION_MS = 2500;
 
+/**
+ * Returns a [+]/[-] button of the given class, found through the data bound
+ * to it by d3: the node id, or the id of the individual or spouse in the node.
+ */
+async function expanderButton(
+  page: Page,
+  className: string,
+  key: 'id' | 'indi' | 'spouse',
+  id: string,
+) {
+  await page.evaluate(
+    ({className, key, id}) => {
+      document.querySelectorAll('g.expander').forEach((element) => {
+        const node = (
+          element as unknown as {
+            __data__?: {
+              id?: string;
+              data?: {indi?: {id?: string}; spouse?: {id?: string}};
+            };
+          }
+        ).__data__;
+        const nodeId = key === 'id' ? node?.id : node?.data?.[key]?.id;
+        element.toggleAttribute(
+          'data-test-button',
+          element.classList.contains(className) && nodeId === id,
+        );
+      });
+    },
+    {className, key, id},
+  );
+  return page.locator('g.expander[data-test-button]');
+}
+
 /** The [+]/[-] button above Jarmila, which shows or hides her parents. */
-async function jarmilaButton(page: Page) {
-  // Mark the button, found through the data bound to it by d3.
-  await page.evaluate(() => {
-    document.querySelectorAll('g.expander').forEach((element) => {
-      const data = (
-        element as unknown as {__data__?: {data?: {spouse?: {id?: string}}}}
-      ).__data__?.data;
-      const isJarmila =
-        element.classList.contains('spouseExpander') &&
-        data?.spouse?.id === 'I2';
-      element.toggleAttribute('data-jarmila', isJarmila);
-    });
-  });
-  return page.locator('g.expander[data-jarmila]');
+function jarmilaButton(page: Page) {
+  return expanderButton(page, 'spouseExpander', 'spouse', 'I2');
 }
 
 /** Clicks the [+]/[-] button above Jarmila. */
@@ -77,6 +99,67 @@ test.describe('Collapse buttons', () => {
     await page.getByRole('button', {name: 'Expand all branches'}).click();
 
     await expect(chart).toContainText('Temuri');
+  });
+
+  test('hide a single child', async ({page}) => {
+    await page.goto(URL);
+    const chart = page.getByTestId('chart');
+    await expect(chart).toContainText('Gandalf');
+    /** The button below Bonifacy and Jarmila, for all their children. */
+    const familyButton = () =>
+      expanderButton(page, 'familyExpander', 'id', 'F1');
+    // A [-] has a single line, a [+] has two.
+    await expect((await familyButton()).locator('line')).toHaveCount(1);
+
+    // force: true because the button is small and drawn over the chart links.
+    await (
+      await expanderButton(page, 'childExpander', 'indi', 'I4')
+    ).click({force: true});
+    // Marie and her descendants are hidden, not her brother.
+    await expect(chart).not.toContainText('Marie');
+    await expect(chart).not.toContainText('Gandalf');
+    await expect(chart).toContainText('Asim');
+    await page.waitForTimeout(ANIMATION_MS);
+
+    // The family button shows [+], which shows the hidden child again.
+    await expect((await familyButton()).locator('line')).toHaveCount(2);
+    await (await familyButton()).click({force: true});
+    await expect(chart).toContainText('Marie');
+    await expect(chart).toContainText('Gandalf');
+    await page.waitForTimeout(ANIMATION_MS);
+    expect(await boxOpacity(page, 'Marie')).toBe('1');
+    await expect((await familyButton()).locator('line')).toHaveCount(1);
+  });
+
+  test('keep the nearest sibling of a hidden child in place', async ({
+    page,
+  }) => {
+    await page.goto(URL);
+    await expect(page.getByTestId('chart')).toContainText('Gandalf');
+    // Zoom in, and scroll to the right, so that the view can follow the chart
+    // when it becomes narrower.
+    for (let i = 0; i < 4; i++) {
+      await page.locator('.zoom-in').click();
+    }
+    await page.waitForTimeout(ANIMATION_MS);
+    await page.locator('#svgContainer').evaluate((container) => {
+      container.scrollLeft = container.scrollWidth;
+    });
+    await page.waitForTimeout(ANIMATION_MS);
+    const marieButton = () =>
+      expanderButton(page, 'childExpander', 'indi', 'I4');
+    const before = await (await marieButton()).boundingBox();
+
+    // Hide Asim, the brother of Marie, on her left.
+    await (
+      await expanderButton(page, 'childExpander', 'indi', 'I3')
+    ).click({force: true});
+    await expect(page.getByTestId('chart')).not.toContainText('Asim');
+    await page.waitForTimeout(ANIMATION_MS);
+
+    const after = await (await marieButton()).boundingBox();
+    expect(Math.abs((after?.x ?? 0) - (before?.x ?? 0))).toBeLessThan(2);
+    expect(Math.abs((after?.y ?? 0) - (before?.y ?? 0))).toBeLessThan(2);
   });
 
   test('stay collapsed when a setting changes', async ({page}) => {
